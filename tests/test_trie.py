@@ -5,6 +5,7 @@ import numpy as np
 from transformers import AutoTokenizer
 
 from genlm.backend.llm import MockAsyncLM
+from genlm.backend.tokenization import Token
 from genlm.bytes import TokenByteTrie, AsyncTokenByteTrie
 from genlm.bytes.byte_lm.trie_state import TrieMode
 
@@ -13,7 +14,12 @@ from hypothesis import given, strategies as st
 
 @pytest.fixture()
 def decode():
-    return [b"a", b"b", b"ab", b"<eos>"]
+    return [
+        Token(token_id=0, byte_string=b"a"),
+        Token(token_id=1, byte_string=b"b"),
+        Token(token_id=2, byte_string=b"ab"),
+        Token(token_id=3, byte_string=b"<eos>"),
+    ]
 
 
 @pytest.fixture(scope="module")
@@ -23,19 +29,22 @@ def mock_llm():
 
 @st.composite
 def tokens_and_weights(draw, n_weights):
-    vocab = draw(
+    byte_vocab = draw(
         st.lists(
             st.binary(min_size=1, max_size=5), min_size=1, max_size=10, unique=True
         )
     )
 
     # Ensure we have at least two tokens with a shared prefix.
-    for token in vocab:
+    for token in byte_vocab:
         if len(token) > 1:
             new_token = token[:-1]
-            if new_token not in vocab:
-                vocab.append(new_token)
+            if new_token not in byte_vocab:
+                byte_vocab.append(new_token)
                 break
+
+    # Convert to Token objects
+    vocab = [Token(token_id=i, byte_string=b) for i, b in enumerate(byte_vocab)]
 
     weights = []
     for _ in range(n_weights):
@@ -57,13 +66,18 @@ def make_wants(trie, weights, op, f):
 
     leaf_wants = {}
     for token, weight in zip(trie.decode, weights):
-        assert token in trie.word2leaf
-        leaf_wants[token] = weight
+        # Token objects: use (byte_string, token_id) as key for word2leaf
+        token_bytes = token.byte_string
+        token_id = token.token_id
+        word2leaf_key = (token_bytes, token_id)
+        assert word2leaf_key in trie.word2leaf, f"Key {word2leaf_key} not in word2leaf"
+        leaf_wants[word2leaf_key] = weight
 
     internal_wants = {}
     for token, weight in zip(trie.decode, weights):
-        for i in range(len(token) + 1):
-            prefix = token[:i]
+        token_bytes = token.byte_string
+        for i in range(len(token_bytes) + 1):
+            prefix = token_bytes[:i]
             if prefix not in internal_wants:
                 internal_wants[f(prefix)] = weight
             else:
@@ -86,23 +100,28 @@ def assert_weights_close(trie, leaf_wants, internal_wants, haves, f):
         want = internal_wants[f(prefix)]
         assert np.isclose(have, want, rtol=1e-5, atol=1e-8), [have, want, prefix]
 
-    for word in trie.decode:
-        assert word in trie.word2leaf
-        node = trie.word2leaf[word]
+    for token in trie.decode:
+        # Token objects: use (byte_string, token_id) as key for word2leaf
+        token_bytes = token.byte_string
+        token_id = token.token_id
+        word2leaf_key = (token_bytes, token_id)
+        assert word2leaf_key in trie.word2leaf
+        node = trie.word2leaf[word2leaf_key]
         have = haves[node]
-        want = leaf_wants[word]
-        assert np.isclose(have, want, rtol=1e-5, atol=1e-8), [have, want, word]
+        want = leaf_wants[word2leaf_key]
+        assert np.isclose(have, want, rtol=1e-5, atol=1e-8), [have, want, token_bytes]
 
 
 def test_weight_sum_single(decode):
     trie = TokenByteTrie(decode=decode)
     haves = trie.weight_sum(torch.tensor([0.1, 0.2, 0.2, 0.5]))
 
+    # leaf_wants now uses (bytes, token_id) keys
     leaf_wants = {
-        b"a": 0.1,
-        b"b": 0.2,
-        b"ab": 0.2,
-        b"<eos>": 0.5,
+        (b"a", 0): 0.1,
+        (b"b", 1): 0.2,
+        (b"ab", 2): 0.2,
+        (b"<eos>", 3): 0.5,
     }
     internal_wants = {
         b"": 1,
@@ -120,14 +139,15 @@ def test_weight_sum_single(decode):
 
 
 def test_weight_sum_single_atomic(decode):
-    trie = TokenByteTrie(decode=decode, atomic_tokens=[b"ab"])
+    trie = TokenByteTrie(decode=decode, atomic_byte_strings=[b"ab"])
     haves = trie.weight_sum(torch.tensor([0.1, 0.2, 0.2, 0.5]))
 
+    # leaf_wants now uses (bytes, token_id) keys
     leaf_wants = {
-        b"a": 0.1,
-        b"b": 0.2,
-        b"ab": 0.2,
-        b"<eos>": 0.5,
+        (b"a", 0): 0.1,
+        (b"b", 1): 0.2,
+        (b"ab", 2): 0.2,
+        (b"<eos>", 3): 0.5,
     }
     internal_wants = {
         b"": 1,
@@ -282,15 +302,19 @@ def test_visualize(decode):
 @pytest.mark.asyncio
 async def test_eos_token_configuration():
     """Test EOS token configuration in trie."""
-    vocab = [b"hello", b"world", b"<eos>"]
-    eos_tokens = [b"<eos>"]
+    vocab = [
+        Token(token_id=0, byte_string=b"hello"),
+        Token(token_id=1, byte_string=b"world"),
+        Token(token_id=2, byte_string=b"<eos>"),
+    ]
+    eos_byte_strings = [b"<eos>"]
 
     # Test trie with EOS tokens
-    trie = TokenByteTrie(decode=vocab, eos_tokens=eos_tokens)
+    trie = TokenByteTrie(decode=vocab, eos_byte_strings=eos_byte_strings)
 
-    # EOS token should be in the eos_tokens set
-    assert b"<eos>" in trie.eos_tokens
-    assert len(trie.eos_tokens) == 1
+    # EOS token should be in the eos_byte_strings set
+    assert b"<eos>" in trie.eos_byte_strings
+    assert len(trie.eos_byte_strings) == 1
 
     # EOS token IDs should be populated
     assert len(trie.eos_token_ids) == 1
@@ -307,10 +331,14 @@ async def test_eos_token_configuration():
 @pytest.mark.asyncio
 async def test_eos_dual_matrix_behavior():
     """Test dual matrix behavior for propagate_eos vs no_eos modes."""
-    vocab = [b"hello", b"world", b"<eos>"]
-    eos_tokens = [b"<eos>"]
+    vocab = [
+        Token(token_id=0, byte_string=b"hello"),
+        Token(token_id=1, byte_string=b"world"),
+        Token(token_id=2, byte_string=b"<eos>"),
+    ]
+    eos_byte_strings = [b"<eos>"]
 
-    trie = TokenByteTrie(decode=vocab, eos_tokens=eos_tokens)
+    trie = TokenByteTrie(decode=vocab, eos_byte_strings=eos_byte_strings)
     weights = torch.tensor([0.3, 0.4, 0.3])  # hello, world, <eos>
 
     # Test no_eos mode (no EOS node mass)
@@ -338,10 +366,14 @@ async def test_eos_dual_matrix_behavior():
 @pytest.mark.asyncio
 async def test_eos_weight_sum_with_eos():
     """Test weight_sum_with_eos method."""
-    vocab = [b"hello", b"world", b"<eos>"]
-    eos_tokens = [b"<eos>"]
+    vocab = [
+        Token(token_id=0, byte_string=b"hello"),
+        Token(token_id=1, byte_string=b"world"),
+        Token(token_id=2, byte_string=b"<eos>"),
+    ]
+    eos_byte_strings = [b"<eos>"]
 
-    trie = TokenByteTrie(decode=vocab, eos_tokens=eos_tokens)
+    trie = TokenByteTrie(decode=vocab, eos_byte_strings=eos_byte_strings)
     weights = torch.tensor([0.3, 0.4, 0.1])  # hello, world, <eos>
 
     # Test with_eos mode
@@ -359,15 +391,20 @@ async def test_eos_weight_sum_with_eos():
 @pytest.mark.asyncio
 async def test_eos_multiple_tokens():
     """Test with multiple EOS tokens."""
-    vocab = [b"hello", b"world", b"dog", b"dogs"]
-    eos_tokens = [b"dog", b"dogs"]
+    vocab = [
+        Token(token_id=0, byte_string=b"hello"),
+        Token(token_id=1, byte_string=b"world"),
+        Token(token_id=2, byte_string=b"dog"),
+        Token(token_id=3, byte_string=b"dogs"),
+    ]
+    eos_byte_strings = [b"dog", b"dogs"]
 
-    trie = TokenByteTrie(decode=vocab, eos_tokens=eos_tokens)
+    trie = TokenByteTrie(decode=vocab, eos_byte_strings=eos_byte_strings)
 
     # Should have both EOS tokens
-    assert len(trie.eos_tokens) == 2
-    assert b"dog" in trie.eos_tokens
-    assert b"dogs" in trie.eos_tokens
+    assert len(trie.eos_byte_strings) == 2
+    assert b"dog" in trie.eos_byte_strings
+    assert b"dogs" in trie.eos_byte_strings
 
     # Should have both EOS token IDs
     assert len(trie.eos_token_ids) == 2
@@ -385,15 +422,116 @@ async def test_eos_multiple_tokens():
 
 
 def test_invalid_device():
+    vocab = [
+        Token(token_id=0, byte_string=b"a"),
+        Token(token_id=1, byte_string=b"b"),
+        Token(token_id=2, byte_string=b"c"),
+    ]
     with pytest.raises(ValueError):
-        TokenByteTrie(decode=["a", "b", "c"], device="invalid")
+        TokenByteTrie(decode=vocab, device="invalid")
 
 
-def test_invalid_eos_tokens():
+def test_plain_bytes_decode_deprecation():
+    """Test that passing plain bytes to TokenByteTrie warns and converts."""
+    with pytest.warns(DeprecationWarning, match="Passing plain bytes to TokenByteTrie is deprecated"):
+        trie = TokenByteTrie(decode=[b"a", b"b", b"ab"])
+    assert all(isinstance(t, Token) for t in trie.decode)
+    assert trie.decode[0].token_id == 0
+    assert trie.decode[0].byte_string == b"a"
+
+
+def test_invalid_eos_byte_strings():
+    vocab = [
+        Token(token_id=0, byte_string=b"a"),
+        Token(token_id=1, byte_string=b"b"),
+        Token(token_id=2, byte_string=b"c"),
+    ]
     with pytest.raises(ValueError):
-        TokenByteTrie(decode=["a", "b", "c"], eos_tokens=["d"])
+        TokenByteTrie(decode=vocab, eos_byte_strings=[b"d"])
 
 
-def test_invalid_atomic_tokens():
+def test_invalid_atomic_byte_strings():
+    vocab = [
+        Token(token_id=0, byte_string=b"a"),
+        Token(token_id=1, byte_string=b"b"),
+        Token(token_id=2, byte_string=b"c"),
+    ]
     with pytest.raises(ValueError):
-        TokenByteTrie(decode=["a", "b", "c"], atomic_tokens=["d"])
+        TokenByteTrie(decode=vocab, atomic_byte_strings=[b"d"])
+
+
+def test_duplicate_byte_strings_with_tokens():
+    """Test that trie correctly handles multiple tokens with the same byte string."""
+    # Create Token objects with duplicate byte strings
+    vocab = [
+        Token(token_id=0, byte_string=b"a"),
+        Token(token_id=1, byte_string=b"hello"),
+        Token(token_id=2, byte_string=b"hello"),  # Duplicate byte string!
+        Token(token_id=3, byte_string=b"world"),
+    ]
+
+    trie = TokenByteTrie(decode=vocab)
+
+    # Verify that all tokens got their own leaf nodes
+    assert len(trie.token_id_to_leaf) == 4
+
+    # Get the leaf nodes for duplicate tokens
+    leaf_1 = trie.token_id_to_leaf[1][1]
+    leaf_2 = trie.token_id_to_leaf[2][1]
+
+    # Should have different leaf nodes
+    assert leaf_1 != leaf_2, "Tokens with same byte_string should have different leaves"
+
+    # Both should be valid leaf nodes
+    assert leaf_1 in trie.leaf2word.keys()
+    assert leaf_2 in trie.leaf2word.keys()
+
+
+def test_duplicate_byte_strings_weight_sum():
+    """Test that weight sums work correctly with duplicate byte strings."""
+    vocab = [
+        Token(token_id=0, byte_string=b"a"),
+        Token(token_id=1, byte_string=b"hello"),
+        Token(token_id=2, byte_string=b"hello"),  # Duplicate!
+        Token(token_id=3, byte_string=b"world"),
+    ]
+
+    trie = TokenByteTrie(decode=vocab)
+
+    # Assign different weights to the duplicate tokens
+    weights = torch.tensor([0.1, 0.3, 0.5, 0.1])
+
+    node_weights = trie.weight_sum(weights)
+
+    # Get the leaf weights for the duplicate tokens
+    leaf_1 = trie.token_id_to_leaf[1][1]
+    leaf_2 = trie.token_id_to_leaf[2][1]
+
+    # Each leaf should have its own weight
+    assert np.isclose(node_weights[leaf_1].item(), 0.3, rtol=1e-5)
+    assert np.isclose(node_weights[leaf_2].item(), 0.5, rtol=1e-5)
+
+    # The parent node (at "hello" prefix) should have the sum of both
+    # Find the shared parent node (before EOT edges)
+    hello_prefix = list(b"hello")
+    for node, prefix in trie.node2prefix.items():
+        if prefix == hello_prefix and node not in trie.leaf2word:
+            # This is the internal node before the EOT edges
+            expected_sum = 0.3 + 0.5  # Sum of both "hello" tokens
+            assert np.isclose(node_weights[node].item(), expected_sum, rtol=1e-5)
+            break
+
+
+def test_requires_token_objects():
+    """Test that TokenByteTrie warns for raw bytes and rejects non-bytes types."""
+    with pytest.warns(DeprecationWarning, match="Passing plain bytes"):
+        TokenByteTrie(decode=[b"a", b"b", b"c"])
+
+    with pytest.raises(TypeError, match="decode must contain Token objects"):
+        TokenByteTrie(decode=["a", "b", "c"])
+
+
+def test_empty_decode_raises():
+    """Test that empty decode raises ValueError."""
+    with pytest.raises(ValueError, match="decode cannot be empty"):
+        TokenByteTrie(decode=[])

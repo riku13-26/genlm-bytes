@@ -1,10 +1,10 @@
 import asyncio
+import warnings
 import numpy as np
 from arsenal import colors
 from dataclasses import dataclass
 from scipy.special import logsumexp as scipy_logsumexp
 from functools import cached_property
-from genlm.backend.tokenization.bytes import get_byte_vocab
 
 from ..util import logsumexp, LazyByteProbs
 from ..trie import AsyncTokenByteTrie
@@ -22,7 +22,7 @@ class BeamParams:
         prune_threshold (float, optional): Probability threshold for pruning candidates.
             Candidates with probability below this are removed. Defaults to 0.0
         verbose (bool, optional): Whether to print the beam state at each step. Defaults to False
-        eos_tokens (list[bytes], optional): List of tokens that should be treated as EOS. When configured,
+        eos_byte_strings (list[bytes], optional): List of tokens that should be treated as EOS. When configured,
             EOS tokens will terminate generation when sampled. Defaults to None
         heal (bool, optional): Whether to enable adaptive token healing. Defaults to True
         heal_max_backoff (int, optional): Maximum number of bytes to back off when healing. Defaults to None
@@ -32,15 +32,29 @@ class BeamParams:
     K: int
     prune_threshold: float = 0.0
     verbose: bool = False
-    eos_tokens: list[bytes] = None
+    eos_byte_strings: list[bytes] = None
     heal: bool = True
     heal_max_backoff: int | None = None
     # Optional cap on how many intra-partial commits are allowed during a
     # single healing attempt. None means unlimited. Set to 0 to disable
     # multi-split behavior (i.e., single-split only).
     heal_max_splits: int | None = None
+    # Deprecated alias for eos_byte_strings
+    eos_tokens: list[bytes] = None
 
     def __post_init__(self):
+        if self.eos_tokens is not None:
+            if self.eos_byte_strings is not None:
+                raise TypeError(
+                    "Cannot specify both 'eos_byte_strings' and the deprecated 'eos_tokens'."
+                )
+            warnings.warn(
+                "'eos_tokens' is deprecated, use 'eos_byte_strings' instead.",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+            self.eos_byte_strings = self.eos_tokens
+            self.eos_tokens = None
         if self.prune_threshold < 0:
             raise ValueError(
                 f"prune_threshold must be non-negative, got {self.prune_threshold}"
@@ -48,7 +62,7 @@ class BeamParams:
         self.log_prune_threshold = (
             np.log(self.prune_threshold) if self.prune_threshold > 0 else -np.inf
         )
-        self.eos_tokens = set(self.eos_tokens) if self.eos_tokens else set()
+        self.eos_byte_strings = set(self.eos_byte_strings) if self.eos_byte_strings else set()
 
 
 class ByteBeamState(StatefulByteLM):
@@ -71,7 +85,7 @@ class ByteBeamState(StatefulByteLM):
         """Creates initial beam state.
 
         Args:
-            llm (StatefulTokenizedLM): Token-level language model to use.
+            llm (genlm.backend.AsyncLM): Token-level language model to use.
             params (BeamParams): Beam search parameters.
             trie_opts (dict, optional): Additional keyword arguments passed to
                 AsyncTokenByteTrie.from_vocab. For example, {"max_batch_size": 100}.
@@ -81,10 +95,11 @@ class ByteBeamState(StatefulByteLM):
         """
         # Handle EOS tokens
         trie_opts = trie_opts or {}
-        trie_opts["eos_tokens"] = params.eos_tokens
+        trie_opts["eos_byte_strings"] = params.eos_byte_strings
 
+        # Use llm.byte_vocab which contains Token objects (supports duplicate byte strings)
         async_trie = AsyncTokenByteTrie.from_vocab(
-            get_byte_vocab(llm.tokenizer), **trie_opts
+            llm.byte_vocab, **trie_opts
         )
         state = LazyTrieState.initial(llm, async_trie, mode=TrieMode.WITH_EOS)
         return cls([await state.materialize()], params)
@@ -162,18 +177,22 @@ class ByteBeamState(StatefulByteLM):
     async def extend(self, logZ):
         """Attempts to advance each candidate in the beam by a token (EOT).
 
-        For each candididate with EOT available, this ends the current token and
+        For each candidate with EOT available, this ends the current token and
         starts a new one in preparation for the next byte.
 
+        With duplicate tokens (multiple token IDs mapping to the same byte string),
+        a single state can have multiple extensions - one for each possible token.
+
         Args:
-            logZ (float): Current estimated of the partition function for pruning
+            logZ (float): Current estimate of the partition function for pruning
 
         Returns:
             (list[LazyTrieState]): New candidate states after extension
         """
         extends = []
         for state in self:
-            if new_state := state.extend():
+            # extend_all() returns all possible extensions (one per token at this position)
+            for new_state in state.extend_all():
                 logZ = np.logaddexp(logZ, new_state.weight)
                 extends.append(new_state)
 

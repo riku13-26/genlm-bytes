@@ -1,9 +1,12 @@
 import torch
 import asyncio
 import logging
+import warnings
 import numpy as np
 from enum import Enum
 from collections import defaultdict
+
+from genlm.backend.tokenization import Token
 
 EOS = 257
 logger = logging.getLogger(__name__)
@@ -17,41 +20,64 @@ class TrieMode(Enum):
 
 
 class TokenByteTrie:
-    """A trie data structure for efficient token-to-byte mapping."""
+    """A trie data structure for efficient token-to-byte mapping.
+    
+    Requires Token objects (from genlm.backend.tokenization) which allow handling 
+    models with duplicate byte strings (multiple token IDs mapping to the same bytes).
+    """
 
     def __init__(
         self,
         decode,
         device=None,
-        atomic_tokens=None,
-        eot_token=None,
-        eos_tokens=None,
+        atomic_byte_strings=None,
+        eot_sentinel=None,
+        eos_byte_strings=None,
         max_batch_size=64,
     ):
         """Initialize a `TokenByteTrie`.
 
         Args:
-            decode (list[bytes]): List representing the token vocabulary.
+            decode (list[Token]): List of Token objects representing the token vocabulary.
+                Each Token must have both token_id and byte_string attributes.
             device (str, optional): Device to use for weight sum and max computations ('cpu' or 'cuda').
-            atomic_tokens (list[bytes], optional): List of tokens that should be treated as atomic units rather than being split into bytes.
-            eot_token (bytes|None, optional): End-of-token token. Default is None, which represents EOT as None.
-            eos_tokens (set[bytes], optional): Set of tokens that should be treated as EOS (End of Sequence).
+            atomic_byte_strings (list[bytes], optional): List of byte strings that should be treated as atomic units rather than being split into individual bytes.
+            eot_sentinel (bytes|None, optional): End-of-token sentinel value. Default is None, which represents EOT as None.
+            eos_byte_strings (set[bytes], optional): Set of tokens that should be treated as EOS (End of Sequence).
             max_batch_size (int, optional): Maximum batch size for weight sum sparse matrix multiplication.
         """
+        if not decode:
+            raise ValueError("decode cannot be empty")
+        if Token.is_plain_bytes(decode[0]):
+            warnings.warn(
+                "Passing plain bytes to TokenByteTrie is deprecated. "
+                "Use Token objects from decode_vocab() instead.",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+            decode = [Token(token_id=i, byte_string=b) for i, b in enumerate(decode)]
+        elif not isinstance(decode[0], Token):
+            raise TypeError(
+                f"decode must contain Token objects, got {type(decode[0]).__name__}. "
+                f"Use genlm.backend.tokenization.decode_vocab() to get Token objects."
+            )
+
         self.decode = decode
+        self._byte_decode = [t.byte_string for t in decode]
         self.max_batch_size = max_batch_size
 
         self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
         if self.device not in ["cpu", "cuda"]:
             raise ValueError(f"Invalid device: {device}. Must be 'cpu', 'cuda' or None")
 
-        self.eot_token = eot_token
-        self.eos_tokens = set(eos_tokens or [])
+        self.eot_sentinel = eot_sentinel
+        self.eos_byte_strings = set(eos_byte_strings or [])
         self.eos_token_ids = [
-            i for i, token in enumerate(decode) if token in self.eos_tokens
+            token.token_id for token in self.decode 
+            if token.byte_string in self.eos_byte_strings
         ]
 
-        self._build_trie(atomic_tokens or [])
+        self._build_trie(atomic_byte_strings or [])
         self._renumber()
         self._build_node2prefix()
         self._build_reachability_matrix()
@@ -59,19 +85,25 @@ class TokenByteTrie:
             self.token_id_to_leaf[:, 0], dtype=torch.long, device=self.device
         )
 
-    def _build_trie(self, atomic_tokens):
+    def _build_trie(self, atomic_byte_strings):
         """Builds a trie data structure from the vocabulary.
+
+        Handles duplicate byte strings by using (byte_string, token_id) as keys.
+        Each token gets its own leaf node, even if multiple tokens share the same bytes.
 
         Returns:
             (dict): A dictionary where keys are token IDs and values are lists of characters.
         """
-        for token in atomic_tokens:
-            if token not in self.decode:
-                raise ValueError(f"Atomic token {token} not in vocabulary")
+        # Check atomic_byte_strings against byte representations
+        byte_set = set(self._byte_decode)
+        for bs in atomic_byte_strings:
+            if bs not in byte_set:
+                raise ValueError(f"Atomic byte string {bs!r} not in vocabulary")
 
-        for token in self.eos_tokens:
-            if token not in self.decode:
-                raise ValueError(f"EOS token {token} not in vocabulary")
+        # Check eos_byte_strings against byte representations
+        for bs in self.eos_byte_strings:
+            if bs not in byte_set:
+                raise ValueError(f"EOS byte string {bs!r} not in vocabulary")
 
         self.word2leaf = {}
         self.children = [{}]  # First node is root
@@ -79,24 +111,34 @@ class TokenByteTrie:
         self.token_id_to_leaf = []
         self.lookup = {}
 
-        for token_id, word in enumerate(self.decode):
-            if word in self.lookup:
-                raise ValueError(f"Duplicate word in vocabulary: {word}")
-            self.lookup[word] = token_id
+        for token in self.decode:
+            token_id = token.token_id
+            word = token.byte_string
+            
+            # Use (word, token_id) as lookup key to allow duplicates
+            lookup_key = (word, token_id)
+            if lookup_key in self.lookup:  # pragma: no cover
+                # This should never happen since Token objects have unique token_ids
+                raise ValueError(f"Duplicate token in vocabulary: {token}, lookup_key: {lookup_key}")
+            self.lookup[lookup_key] = token_id
 
             # Build ALL tokens in trie (including EOS tokens for conditioning mode)
             curr = self.root
-            letters = [word] if word in atomic_tokens else word
+            letters = [word] if word in atomic_byte_strings else word
             for letter in letters:
                 if letter not in self.children[curr]:
                     self.children[curr][letter] = len(self.children)
                     self.children.append({})
                 curr = self.children[curr][letter]
 
-            self.children[curr][self.eot_token] = last = len(self.children)
+            # Each token gets its own leaf, using (eot_sentinel, token_id) as edge key
+            # This allows multiple tokens with the same byte_string to have separate leaves
+            leaf_edge_key = (self.eot_sentinel, token_id)
+            self.children[curr][leaf_edge_key] = last = len(self.children)
             self.children.append({})
-            assert word not in self.word2leaf
-            self.word2leaf[word] = last
+            
+            # Use (word, token_id) as key in word2leaf to handle duplicates
+            self.word2leaf[(word, token_id)] = last
             self.token_id_to_leaf.append((token_id, last))
 
         self.eos_node = len(self.children)
@@ -130,7 +172,11 @@ class TokenByteTrie:
             int: Node indices in topological order
         """
         for a in self.children[node]:
-            if a is not None:
+            # Skip leaf edges (tuples like (eot_sentinel, token_id)) from ordering
+            # but include all other edges including EOS (257)
+            if isinstance(a, tuple):
+                pass  # Skip leaf edges in ordering
+            else:
                 yield from self._order(self.children[node][a])
         yield node
 
@@ -189,11 +235,14 @@ class TokenByteTrie:
         node2prefix = {self.root: []}
         for x in reversed(range(len(self.children))):
             for letter, y in self.children[x].items():
-                if letter is None:
+                # Handle leaf edges: (eot_sentinel, token_id) tuples
+                if isinstance(letter, tuple):
+                    # This is a leaf edge, prefix stays the same
                     node2prefix[y] = node2prefix[x]
                 elif isinstance(letter, bytes):
                     node2prefix[y] = node2prefix[x] + list(letter)
                 else:
+                    # Regular byte transition (int)
                     node2prefix[y] = node2prefix[x] + [letter]
 
         self.node2prefix = node2prefix
@@ -229,11 +278,12 @@ class TokenByteTrie:
         for i, node in enumerate(leaf_indices):
             token_id = self.token_id_to_leaf[i, 0]
             token = self.decode[token_id]
+            token_bytes = token.byte_string
 
             # self-connection
             rows_no_eos.append(i)
             cols_no_eos.append(node)
-            if token not in self.eos_tokens:
+            if token_bytes not in self.eos_byte_strings:
                 rows_with_eos.append(i)
                 cols_with_eos.append(node)
             else:
@@ -248,7 +298,7 @@ class TokenByteTrie:
                 ancestor = parent[current]
                 rows_no_eos.append(i)
                 cols_no_eos.append(ancestor)
-                if token not in self.eos_tokens:
+                if token_bytes not in self.eos_byte_strings:
                     rows_with_eos.append(i)
                     cols_with_eos.append(ancestor)
                 current = ancestor
@@ -464,10 +514,13 @@ class TokenByteTrie:
 
         for node_id, children in enumerate(self.children):
             for char, child_id in children.items():
-                if char is not None:
-                    edge_label = str(char)
+                # Handle leaf edges: (eot_sentinel, token_id) tuples
+                if isinstance(char, tuple):
+                    _, token_id = char
+                    edge_label = f"EOT (ID: {token_id})"
                 else:
-                    edge_label = "End-of-Token"
+                    # Regular byte transition (int) or EOS
+                    edge_label = str(char)
 
                 dot.edge(str(node_id), str(child_id), label=edge_label)
 
@@ -499,9 +552,10 @@ class AsyncTokenByteTrie:
         """Creates an `AsyncTokenByteTrie` from a vocabulary.
 
         Args:
-            vocab (list): The vocabulary over which the trie will be defined.
+            vocab (list[Token]): List of Token objects representing the vocabulary.
+                Use genlm.backend.tokenization.decode_vocab() to get Token objects from a tokenizer.
             **kwargs (dict): Additional arguments passed to the trie constructor.
-                             Can include 'eos_tokens' for EOS support.
+                             Can include 'eos_byte_strings' for EOS support.
 
         Returns:
             (AsyncTokenByteTrie): The initialized asynchronous trie instance.
@@ -595,7 +649,7 @@ class AsyncTokenByteTrie:
                             )  # pragma: no cover
                         # MAX operations don't need mode, so use the original batch_weight_max
                         results = self.trie.batch_weight_max(ws_list)
-                    else:
+                    else:  # pragma: no cover
                         raise ValueError(f"Unknown trie operation: {op}")
 
                     for future, result in zip(futures, results):
