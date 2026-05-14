@@ -214,12 +214,12 @@ class LazyTrieState:
         """
         if self._mass is None:
             logp_next = await self.lm_state.logp_next()
-            shift = logp_next.max()  # max-shift trick to avoid underflow in exp
+            shift = logp_next.max()  # log-sum-exp stabilization
             shifted_mass = await self.trie.weight_sum(
                 torch.exp(logp_next - shift), self.mode
             )
-            mass = torch.log(shifted_mass) + shift.to(device=shifted_mass.device)
-            self._mass = mass.cpu().numpy()
+            log_mass = torch.log(shifted_mass) + shift.to(device=shifted_mass.device)
+            self._mass = log_mass.cpu().numpy()
         return self
 
     def __repr__(self):  # pragma: no cover
